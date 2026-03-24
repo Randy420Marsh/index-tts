@@ -9,8 +9,27 @@ import warnings
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
+# DeepSpeed: deprecated mp_size config field
+warnings.filterwarnings("ignore", message=".*mp_size.*deprecated.*", category=UserWarning)
+# Transformers: GenerationMixin inheritance warning for GPT2InferenceModel
+warnings.filterwarnings("ignore", message=".*GenerationMixin.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*prepare_inputs_for_generation.*")
+# Transformers: past_key_values tuple deprecation
+warnings.filterwarnings("ignore", message=".*past_key_values.*deprecated.*")
+# Transformers: generation flags not valid
+warnings.filterwarnings("ignore", message=".*generation flags are not valid.*")
+# Suppress DeepSpeed and logging noise at the logging module level too
+import logging
+logging.getLogger("deepspeed").setLevel(logging.ERROR)
+logging.getLogger("transformers").setLevel(logging.ERROR)
 
 import pandas as pd
+
+# ────────────────────────────────────────────────
+# Added for VRAM / memory cleanup after each generation
+import gc
+import torch
+# ────────────────────────────────────────────────
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
@@ -59,6 +78,102 @@ tts = IndexTTS2(model_dir=cmd_args.model_dir,
                 use_deepspeed=cmd_args.deepspeed,
                 use_cuda_kernel=cmd_args.cuda_kernel,
                 )
+
+# ═══════════════════════════════════════════════════════════════════════
+#  LOW-VRAM CPU OFFLOADING  (8 GB card — two-phase time-slice)
+#
+#  IndexTTS2.infer() has two phases with completely different models:
+#
+#    Phase A  get_emb()   semantic_model + campplus   ~2.5 GB weights
+#    Phase B  pipeline    gpt + s2mel + bigvgan + semantic_codec  ~4.5 GB
+#
+#  Both on GPU simultaneously → 7+ GB → OOM on 8 GB cards.
+#
+#  Solution: time-slice.  get_emb() is called at the top of infer() and
+#  its result is immediately cached (won't run again for the same audio).
+#
+#    Startup:       ALL → CPU           (GPU nearly empty)
+#    infer() entry: main → GPU          (Phase B models ready)
+#    get_emb():     main → CPU          (evict to make room)
+#                   emb  → GPU          (run embedding)
+#                   emb  → CPU          (done with embedding)
+#                   main → GPU          (restore for pipeline)
+#    rest of infer: gpt / s2mel / bigvgan run   (max ~4.5 GB peak)
+#    infer() exit:  main → CPU          (GPU clear for next call)
+#
+#  Dynamic discovery: reads tts.__dict__ at runtime — works regardless of
+#  DeepSpeed wrapping, attribute renames, or future model changes.
+# ═══════════════════════════════════════════════════════════════════════
+if torch.cuda.is_available():
+    import torch.nn as nn
+
+    _EMB_ONLY_NAMES = {"semantic_model"}
+
+    def _get_modules():
+        """Live snapshot of {name: nn.Module} from tts."""
+        return {n: v for n, v in vars(tts).items() if isinstance(v, nn.Module)}
+
+    def _move(names, device, modules=None):
+        """Move a named subset of modules to device; warn on failure."""
+        if modules is None:
+            modules = _get_modules()
+        for name in names:
+            mod = modules.get(name)
+            if mod is None:
+                continue
+            try:
+                mod.to(device)
+            except Exception as exc:
+                print(f"→ [low-VRAM] WARNING: cannot move '{name}'→{device}: {exc}")
+        torch.cuda.empty_cache()
+
+    # ── Discover names ───────────────────────────────────────────────────
+    _all_at_start = _get_modules()
+    _emb_names    = {n for n in _all_at_start if n in _EMB_ONLY_NAMES}
+    _main_names   = {n for n in _all_at_start if n not in _EMB_ONLY_NAMES}
+
+    print(f"→ [low-VRAM] All sub-models : {sorted(_all_at_start)}")
+    print(f"→ [low-VRAM] Embedding phase: {sorted(_emb_names)}")
+    print(f"→ [low-VRAM] Pipeline phase : {sorted(_main_names)}")
+
+    # ── Park everything on CPU at startup ────────────────────────────────
+    _move(_all_at_start.keys(), "cpu", _all_at_start)
+    _free_gb = torch.cuda.mem_get_info()[0] / 1024**3
+    print(f"→ [low-VRAM] Startup complete. GPU free: {_free_gb:.2f} GB")
+
+    # ── Capture originals ONCE (before any patching) ─────────────────────
+    _orig_get_emb = tts.get_emb
+    _orig_infer   = tts.infer
+
+    # ── Patch get_emb: full swap — main↔CPU, emb↔GPU, restore after ──────
+    def _patched_get_emb(*args, **kwargs):
+        print("→ [low-VRAM] get_emb: main→CPU, emb→GPU")
+        _move(_main_names, "cpu")
+        _move(_emb_names,  "cuda")
+        try:
+            return _orig_get_emb(*args, **kwargs)
+        finally:
+            print("→ [low-VRAM] get_emb done: emb→CPU, main→GPU")
+            _move(_emb_names,  "cpu")
+            _move(_main_names, "cuda")
+
+    # ── Patch infer: bracket the entire pipeline ──────────────────────────
+    # Pre-load main to GPU so the rest of the pipeline (GPT, s2mel, bigvgan)
+    # is ready immediately after get_emb's own swap puts them back.
+    # Post-call: park everything to free VRAM between generations.
+    def _patched_infer(*args, **kwargs):
+        print("→ [low-VRAM] infer start: main→GPU")
+        _move(_main_names, "cuda")
+        try:
+            return _orig_infer(*args, **kwargs)
+        finally:
+            print("→ [low-VRAM] infer done: all→CPU")
+            _move(_all_at_start.keys(), "cpu")
+
+    tts.get_emb = _patched_get_emb
+    tts.infer   = _patched_infer
+# ═══════════════════════════════════════════════════════════════════════
+
 # 支持的语言列表
 LANGUAGES = {
     "中文": "zh_CN",
@@ -124,17 +239,27 @@ def format_glossary_markdown():
 
     return "\n".join(lines)
 
-def gen_single(emo_control_method,prompt, text,
+def _vram_cleanup():
+    """Force Python GC + CUDA cache flush between generations."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    print("→ VRAM / tensor cleanup performed after generation")
+
+
+def gen_single(emo_control_method, prompt, text,
                emo_ref_path, emo_weight,
                vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
-               emo_text,emo_random,
+               emo_text, emo_random,
                max_text_tokens_per_segment=120,
-                *args, progress=gr.Progress()):
-    output_path = None
-    if not output_path:
-        output_path = os.path.join("outputs", f"spk_{int(time.time())}.wav")
+               *args, progress=gr.Progress()):
+
+    output_path = os.path.join("outputs", f"spk_{int(time.time())}.wav")
+
     # set gradio progress
     tts.gr_progress = progress
+
     do_sample, top_p, top_k, temperature, \
         length_penalty, num_beams, repetition_penalty, max_mel_tokens = args
     kwargs = {
@@ -146,36 +271,59 @@ def gen_single(emo_control_method,prompt, text,
         "num_beams": num_beams,
         "repetition_penalty": float(repetition_penalty),
         "max_mel_tokens": int(max_mel_tokens),
-        # "typical_sampling": bool(typical_sampling),
-        # "typical_mass": float(typical_mass),
     }
+
     if type(emo_control_method) is not int:
         emo_control_method = emo_control_method.value
-    if emo_control_method == 0:  # emotion from speaker
-        emo_ref_path = None  # remove external reference audio
-    if emo_control_method == 1:  # emotion from reference audio
-        pass
-    if emo_control_method == 2:  # emotion from custom vectors
+    if emo_control_method == 0:   # emotion from speaker
+        emo_ref_path = None
+    if emo_control_method == 2:   # emotion from custom vectors
         vec = [vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8]
         vec = tts.normalize_emo_vec(vec, apply_bias=True)
     else:
-        # don't use the emotion vector inputs for the other modes
         vec = None
 
     if emo_text == "":
-        # erase empty emotion descriptions; `infer()` will then automatically use the main prompt
         emo_text = None
 
     print(f"Emo control mode:{emo_control_method},weight:{emo_weight},vec:{vec}")
-    output = tts.infer(spk_audio_prompt=prompt, text=text,
-                       output_path=output_path,
-                       emo_audio_prompt=emo_ref_path, emo_alpha=emo_weight,
-                       emo_vector=vec,
-                       use_emo_text=(emo_control_method==3), emo_text=emo_text,use_random=emo_random,
-                       verbose=cmd_args.verbose,
-                       max_text_tokens_per_segment=int(max_text_tokens_per_segment),
-                       **kwargs)
-    return gr.update(value=output,visible=True)
+
+    # ── Run inference inside no_grad to prevent gradient accumulation ──────
+    # autocast gives free FP16 mixed-precision on the mel/bigvgan passes even
+    # if the model itself was loaded in FP32, squeezing out extra VRAM headroom.
+    use_cuda = torch.cuda.is_available()
+    autocast_ctx = (
+        torch.cuda.amp.autocast(dtype=torch.float16)
+        if (use_cuda and cmd_args.fp16)
+        else torch.amp.autocast("cpu", enabled=False)
+    )
+
+    result_path = None
+    try:
+        with torch.no_grad(), autocast_ctx:
+            result_path = tts.infer(
+                spk_audio_prompt=prompt,
+                text=text,
+                output_path=output_path,
+                emo_audio_prompt=emo_ref_path,
+                emo_alpha=emo_weight,
+                emo_vector=vec,
+                use_emo_text=(emo_control_method == 3),
+                emo_text=emo_text,
+                use_random=emo_random,
+                verbose=cmd_args.verbose,
+                max_text_tokens_per_segment=int(max_text_tokens_per_segment),
+                **kwargs,
+            )
+    finally:
+        # Always clean up VRAM even if inference raised an exception,
+        # so the next attempt starts with a clean slate.
+        try:
+            _vram_cleanup()
+        except Exception as e:
+            print(f"Cleanup warning (non-critical): {e}")
+
+    return gr.update(value=result_path, visible=True)
 
 def update_prompt_audio():
     update_button = gr.update(interactive=True)
@@ -222,7 +370,6 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                     value=EMO_CHOICES_OFFICIAL[0],label=i18n("情感控制方式"))
                 # we MUST have an extra, INVISIBLE list of *all* emotion control
                 # methods so that gr.Dataset() can fetch ALL control mode labels!
-                # otherwise, the gr.Dataset()'s experimental labels would be empty!
                 emo_control_method_all = gr.Radio(
                     choices=EMO_CHOICES_ALL,
                     type="index",
@@ -247,9 +394,9 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                     vec4 = gr.Slider(label=i18n("惧"), minimum=0.0, maximum=1.0, value=0.0, step=0.05)
                 with gr.Column():
                     vec5 = gr.Slider(label=i18n("厌恶"), minimum=0.0, maximum=1.0, value=0.0, step=0.05)
-                    vec6 = gr.Slider(label=i18n("低落"), minimum=0.0, maximum=1.0, value=0.0, step=0.05)
-                    vec7 = gr.Slider(label=i18n("惊喜"), minimum=0.0, maximum=1.0, value=0.0, step=0.05)
-                    vec8 = gr.Slider(label=i18n("平静"), minimum=0.0, maximum=1.0, value=0.0, step=0.05)
+                    vec6 = gr.Slider(label=i18n("低落"), minimum=0.0, maximum=1.0, value=0.05)
+                    vec7 = gr.Slider(label=i18n("惊喜"), minimum=0.0, maximum=1.0, value=0.05)
+                    vec8 = gr.Slider(label=i18n("平静"), minimum=0.0, maximum=1.0, value=0.05)
 
         with gr.Group(visible=False) as emo_text_group:
             create_experimental_warning_message()
@@ -300,9 +447,6 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                         repetition_penalty = gr.Number(label="repetition_penalty", precision=None, value=10.0, minimum=0.1, maximum=20.0, step=0.1)
                         length_penalty = gr.Number(label="length_penalty", precision=None, value=0.0, minimum=-2.0, maximum=2.0, step=0.1)
                     max_mel_tokens = gr.Slider(label="max_mel_tokens", value=1500, minimum=50, maximum=tts.cfg.gpt.max_mel_tokens, step=10, info=i18n("生成Token最大数量，过小导致音频被截断"), key="max_mel_tokens")
-                    # with gr.Row():
-                    #     typical_sampling = gr.Checkbox(label="typical_sampling", value=False, info="不建议使用")
-                    #     typical_mass = gr.Slider(label="typical_mass", value=0.9, minimum=0.0, maximum=1.0, step=0.1)
                 with gr.Column(scale=2):
                     gr.Markdown(f'**{i18n("分句设置")}** _{i18n("参数会影响音频质量和生成速度")}_')
                     with gr.Row():
@@ -320,21 +464,14 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             advanced_params = [
                 do_sample, top_p, top_k, temperature,
                 length_penalty, num_beams, repetition_penalty, max_mel_tokens,
-                # typical_sampling, typical_mass,
             ]
 
-        # we must use `gr.Dataset` to support dynamic UI rewrites, since `gr.Examples`
-        # binds tightly to UI and always restores the initial state of all components,
-        # such as the list of available choices in emo_control_method.
         example_table = gr.Dataset(label="Examples",
             samples_per_page=20,
             samples=get_example_cases(include_experimental=False),
             type="values",
-            # these components are NOT "connected". it just reads the column labels/available
-            # states from them, so we MUST link to the "all options" versions of all components,
-            # such as `emo_control_method_all` (to be able to see EXPERIMENTAL text labels)!
             components=[prompt_audio,
-                        emo_control_method_all,  # important: support all mode labels!
+                        emo_control_method_all,
                         input_text_single,
                         emo_upload,
                         emo_weight,
@@ -361,7 +498,6 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             gr.update(value=example[13]),
         )
 
-    # click() event works on both desktop and mobile UI
     example_table.click(on_example_click,
                         inputs=[example_table],
                         outputs=[prompt_audio,
@@ -392,9 +528,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                 segments_preview: gr.update(value=df),
             }
 
-    # 术语词汇表事件处理函数
     def on_add_glossary_term(term, reading_zh, reading_en):
-        """添加术语到词汇表并自动保存"""
         term = term.rstrip()
         reading_zh = reading_zh.rstrip()
         reading_en = reading_en.rstrip()
@@ -406,9 +540,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         if not reading_zh and not reading_en:
             gr.Warning(i18n("请至少输入一种读法"))
             return gr.update()
-        
 
-        # 构建读法数据
         if reading_zh and reading_en:
             reading = {"zh": reading_zh, "en": reading_en}
         elif reading_zh:
@@ -418,10 +550,8 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         else:
             reading = reading_zh or reading_en
 
-        # 添加到词汇表
         tts.normalizer.term_glossary[term] = reading
 
-        # 自动保存到文件
         try:
             tts.normalizer.save_glossary_to_yaml(tts.glossary_path)
             gr.Info(i18n("词汇表已更新"), duration=1)
@@ -430,33 +560,31 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             print(f"Error details: {e}")
             return gr.update()
 
-        # 更新Markdown表格
         return gr.update(value=format_glossary_markdown())
-        
 
     def on_method_change(emo_control_method):
-        if emo_control_method == 1:  # emotion reference audio
+        if emo_control_method == 1:
             return (gr.update(visible=True),
                     gr.update(visible=False),
                     gr.update(visible=False),
                     gr.update(visible=False),
                     gr.update(visible=True)
                     )
-        elif emo_control_method == 2:  # emotion vectors
+        elif emo_control_method == 2:
             return (gr.update(visible=False),
                     gr.update(visible=True),
                     gr.update(visible=True),
                     gr.update(visible=False),
                     gr.update(visible=True)
                     )
-        elif emo_control_method == 3:  # emotion text description
+        elif emo_control_method == 3:
             return (gr.update(visible=False),
                     gr.update(visible=True),
                     gr.update(visible=False),
                     gr.update(visible=True),
                     gr.update(visible=True)
                     )
-        else:  # 0: same as speaker voice
+        else:
             return (gr.update(visible=False),
                     gr.update(visible=False),
                     gr.update(visible=False),
@@ -474,10 +602,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
     )
 
     def on_experimental_change(is_experimental, current_mode_index):
-        # 切换情感控制选项
         new_choices = EMO_CHOICES_ALL if is_experimental else EMO_CHOICES_OFFICIAL
-        # if their current mode selection doesn't exist in new choices, reset to 0.
-        # we don't verify that OLD index means the same in NEW list, since we KNOW it does.
         new_index = current_mode_index if current_mode_index < len(new_choices) else 0
 
         return (
@@ -492,7 +617,6 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
     )
 
     def on_glossary_checkbox_change(is_enabled):
-        """控制术语词汇表的可见性"""
         tts.normalizer.enable_glossary = is_enabled
         return gr.update(visible=is_enabled)
 
@@ -519,7 +643,6 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                          outputs=[gen_button])
 
     def on_demo_load():
-        """页面加载时重新加载glossary数据"""
         try:
             tts.normalizer.load_glossary_from_yaml(tts.glossary_path)
         except Exception as e:
@@ -527,14 +650,12 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             print(f"Failed to reload glossary on page load: {e}")
         return gr.update(value=format_glossary_markdown())
 
-    # 术语词汇表事件绑定
     btn_add_term.click(
         on_add_glossary_term,
         inputs=[glossary_term, glossary_reading_zh, glossary_reading_en],
         outputs=[glossary_table]
     )
 
-    # 页面加载时重新加载glossary
     demo.load(
         on_demo_load,
         inputs=[],
@@ -549,8 +670,6 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                              *advanced_params,
                      ],
                      outputs=[output_audio])
-
-
 
 if __name__ == "__main__":
     demo.queue(20)
