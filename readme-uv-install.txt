@@ -1,5 +1,9 @@
 #Quick setup readme...
 
+#Might need these:
+
+#sudo apt install -y libpython3.11 libpython3.11-dev ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev
+
 uv python pin 3.11
 
 uv venv .venv --python 3.11
