@@ -2,14 +2,14 @@
 
 # Determine max CPU threads
 MAX_THREADS=$(nproc)
-export TORCH_CUDA_ARCH_LIST="7.5"
+#export TORCH_CUDA_ARCH_LIST="7.5"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 ###############################
 # ffmpeg and CUDA paths
 ###############################
 # Force TorchAudio to look for your specific FFmpeg version
-export TORCHAUDIO_USE_FFMPEG_VERSION=8 
+#export TORCHAUDIO_USE_FFMPEG_VERSION=8 
 
 # Ensure the linker finds your custom build libs and CUDA 12.8 first
 export LD_LIBRARY_PATH=/home/john/build_temp/lib:/usr/local/cuda-12.8/lib64:/usr/local/lib:$LD_LIBRARY_PATH
