@@ -2,4 +2,4 @@
 
 source ./.venv/bin/activate && \
 sudo -v && \
-python rtx_tuner.py
+python rtx_tuner_v2.py
